@@ -3,13 +3,16 @@ package game
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
+	"fmt"
 	"image/color"
 	"log"
 	"math"
+	"os"
 	"sort"
+	"strings"
 
 	"metro-wars/camera"
-	"metro-wars/data"
 	"metro-wars/graph"
 
 	"github.com/hajimehoshi/ebiten/v2"
@@ -25,31 +28,363 @@ type Game struct {
 	fontCache    map[float64]text.Face
 	baseFontSize float64
 	fontsFS      embed.FS
+	darkTheme    bool
+	labelOffsets map[int]struct{ x, y float64 } // ID узла -> смещение метки
+	mapsFS       embed.FS
+
+	// Режим редактирования
+	editMode       bool
+	draggingNodeID int
+	dragOffsetX    float64
+	dragOffsetY    float64
+	mouseX         float64
+	mouseY         float64
+
+	// Работа с картами
+	availableMaps []string // Список доступных карт
+	currentMap    string   // Текущая карта (без .json)
+	showMapMenu   bool     // Показать меню выбора
+}
+
+func (g *Game) scanAvailableMaps() error {
+	entries, err := g.mapsFS.ReadDir("assets/maps")
+	if err != nil {
+		return err
+	}
+
+	g.availableMaps = []string{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		// Убираем .json и _ready suffix
+		baseName := strings.TrimSuffix(name, ".json")
+		baseName = strings.TrimSuffix(baseName, "_ready")
+
+		// Проверяем, что это не _ready версия
+		if !strings.Contains(name, "_ready") {
+			g.availableMaps = append(g.availableMaps, baseName)
+		}
+	}
+
+	sort.Strings(g.availableMaps)
+	return nil
+}
+
+func (g *Game) loadMap(mapName string) error {
+	// Сначала пробуем загрузить _ready версию из файловой системы
+	readyFilename := fmt.Sprintf("assets/maps/%s_ready.json", mapName)
+	readyData, err := os.ReadFile(readyFilename)
+
+	if err == nil {
+		// _ready файл существует, загружаем его
+		g.graph, err = graph.ParseMap(readyData)
+		if err != nil {
+			return fmt.Errorf("failed to parse ready map %s: %v", mapName, err)
+		}
+		log.Printf("Loaded ready map: %s", readyFilename)
+	} else {
+		// _ready файл не найден, загружаем оригинал из embed
+		filename := fmt.Sprintf("assets/maps/%s.json", mapName)
+		g.graph, err = graph.LoadMap(g.mapsFS, filename)
+		if err != nil {
+			return fmt.Errorf("failed to load map %s: %v", mapName, err)
+		}
+		log.Printf("Loaded original map: %s", filename)
+	}
+
+	// Загружаем сохранённые смещения, если есть
+	g.labelOffsets = make(map[int]struct{ x, y float64 })
+	for id, offset := range g.graph.NodeLabelOffsets {
+		g.labelOffsets[id] = struct{ x, y float64 }{x: offset.X, y: offset.Y}
+	}
+
+	// Если смещений нет, рассчитываем
+	if len(g.labelOffsets) == 0 {
+		g.calculateLabelPositions()
+	}
+
+	g.currentMap = mapName
+	log.Printf("Loaded map: %s", mapName)
+	return nil
 }
 
 func New(mapsFS embed.FS, fontsFS embed.FS) (*Game, error) {
 	g := &Game{
-		camera:       camera.New(1920, 1080),
-		fontsFS:      fontsFS,
-		fontCache:    make(map[float64]text.Face),
-		baseFontSize: 14.0,
+		camera:         camera.New(1920, 1080),
+		fontsFS:        fontsFS,
+		fontCache:      make(map[float64]text.Face),
+		mapsFS:         mapsFS,
+		baseFontSize:   10.0,
+		darkTheme:      true,
+		labelOffsets:   make(map[int]struct{ x, y float64 }),
+		draggingNodeID: -1,
+		showMapMenu:    false,
 	}
 
 	// Загружаем карту
 	var err error
-	g.graph, err = graph.LoadMap(mapsFS, "assets/maps/test_map.json")
-	if err != nil {
-		log.Printf("Warning: Could not load map: %v. Using empty graph.", err)
+	// Сканируем доступные карты
+	if err := g.scanAvailableMaps(); err != nil {
+		log.Printf("Warning: Could not scan maps: %v", err)
+		g.availableMaps = []string{"Minsk"} // Fallback
+	}
+
+	g.currentMap = g.availableMaps[0] // Первая карта по умолчанию
+
+	// Загружаем первую карту
+	if err := g.loadMap(g.currentMap); err != nil {
+		log.Printf("Warning: Could not load map: %v", err)
 		g.graph = graph.NewGraph()
 	}
 
-	// Загружаем шрифт
 	g.fontFace, err = g.loadFont("assets/fonts/Roboto-Regular.ttf", 14)
 	if err != nil {
-		log.Printf("Warning: Could not load font: %v. Using fallback.", err)
+		log.Printf("Warning: Could not load font: %v", err)
 	}
 
 	return g, nil
+}
+
+func (g *Game) calculateLabelPositions() {
+	type NodeWithIntersections struct {
+		nodeID        int
+		intersections int
+		offset        struct{ x, y float64 }
+	}
+
+	// Шаг 1: Вычисляем начальные позиции
+	initialOffsets := make(map[int]struct{ x, y float64 })
+
+	for _, node := range g.graph.Nodes {
+		neighbors := g.graph.GetNeighbors(node.ID)
+
+		if len(neighbors) == 0 {
+			initialOffsets[node.ID] = struct{ x, y float64 }{0, -30}
+			continue
+		}
+
+		var dirX, dirY float64
+		for _, neighborID := range neighbors {
+			neighbor := g.graph.Nodes[neighborID]
+			dirX += neighbor.X - node.X
+			dirY += neighbor.Y - node.Y
+		}
+		dirX /= float64(len(neighbors))
+		dirY /= float64(len(neighbors))
+
+		length := math.Sqrt(dirX*dirX + dirY*dirY)
+		if length > 0 {
+			dirX /= length
+			dirY /= length
+		}
+
+		normalX := -dirY
+		normalY := dirX
+		distance := 25.0
+		initialOffsets[node.ID] = struct{ x, y float64 }{normalX * distance, normalY * distance}
+	}
+
+	// Шаг 2: Считаем пересечения с учётом реальных размеров
+	var nodesWithIntersections []NodeWithIntersections
+
+	for nodeID, offset := range initialOffsets {
+		node := g.graph.Nodes[nodeID]
+		labelX := node.X + offset.x
+		labelY := node.Y + offset.y
+
+		// Получаем реальные размеры метки
+		fontFace := g.getFontFace(g.baseFontSize)
+		textWidth, textHeight := text.Measure(node.Name, fontFace, 0)
+		padding := 2.0
+		rectWidth := textWidth + 2*padding
+		rectHeight := textHeight + padding
+
+		intersections := 0
+
+		// Проверяем пересечение с другими узлами
+		for _, otherNode := range g.graph.Nodes {
+			if otherNode.ID == nodeID {
+				continue
+			}
+			dx := labelX - otherNode.X
+			dy := labelY - otherNode.Y
+			if math.Sqrt(dx*dx+dy*dy) < 15 {
+				intersections++
+			}
+		}
+
+		// Проверяем пересечение с другими метками (с учётом их реальных размеров)
+		for otherID, otherOffset := range initialOffsets {
+			if otherID == nodeID {
+				continue
+			}
+			otherNode := g.graph.Nodes[otherID]
+			otherLabelX := otherNode.X + otherOffset.x
+			otherLabelY := otherNode.Y + otherOffset.y
+
+			otherFontFace := g.getFontFace(g.baseFontSize)
+			otherTextWidth, otherTextHeight := text.Measure(otherNode.Name, otherFontFace, 0)
+			otherPadding := 2.0
+			otherRectWidth := otherTextWidth + 2*otherPadding
+			otherRectHeight := otherTextHeight + otherPadding
+
+			// Проверяем пересечение прямоугольников
+			if g.rectanglesIntersect(
+				labelX-rectWidth/2, labelY-rectHeight/2, rectWidth, rectHeight,
+				otherLabelX-otherRectWidth/2, otherLabelY-otherRectHeight/2, otherRectWidth, otherRectHeight,
+			) {
+				intersections++
+			}
+		}
+
+		nodesWithIntersections = append(nodesWithIntersections, NodeWithIntersections{
+			nodeID:        nodeID,
+			intersections: intersections,
+			offset:        offset,
+		})
+	}
+
+	sort.Slice(nodesWithIntersections, func(i, j int) bool {
+		return nodesWithIntersections[i].intersections > nodesWithIntersections[j].intersections
+	})
+
+	// Шаг 3: Размещаем по одной
+	g.labelOffsets = make(map[int]struct{ x, y float64 })
+
+	for _, item := range nodesWithIntersections {
+		node := g.graph.Nodes[item.nodeID]
+		baseOffset := item.offset
+
+		baseAngle := math.Atan2(baseOffset.y, baseOffset.x)
+		baseRadius := math.Sqrt(baseOffset.x*baseOffset.x + baseOffset.y*baseOffset.y)
+
+		// Получаем реальные размеры этой метки
+		fontFace := g.getFontFace(g.baseFontSize)
+		textWidth, textHeight := text.Measure(node.Name, fontFace, 0)
+		padding := 2.0
+		rectWidth := textWidth + 2*padding
+		rectHeight := textHeight + padding
+
+		placed := false
+
+		for radiusMult := 1.0; radiusMult <= 3.0 && !placed; radiusMult += 0.5 {
+			currentRadius := baseRadius * radiusMult
+
+			for angle := 0.0; angle < 360 && !placed; angle += 10 {
+				rad := baseAngle + angle*math.Pi/180.0
+
+				offset := struct{ x, y float64 }{
+					x: currentRadius * math.Cos(rad),
+					y: currentRadius * math.Sin(rad),
+				}
+
+				if !g.hasIntersectionWithPlaced(node.ID, offset, rectWidth, rectHeight) {
+					g.labelOffsets[node.ID] = offset
+					placed = true
+				}
+			}
+		}
+
+		if !placed {
+			g.labelOffsets[node.ID] = baseOffset
+		}
+	}
+}
+
+func (g *Game) hasIntersectionWithPlaced(nodeID int, offset struct{ x, y float64 }, rectWidth, rectHeight float64) bool {
+	node := g.graph.Nodes[nodeID]
+	labelX := node.X + offset.x
+	labelY := node.Y + offset.y
+
+	// Проверяем пересечение с другими узлами
+	for _, otherNode := range g.graph.Nodes {
+		if otherNode.ID == nodeID {
+			continue
+		}
+		dx := labelX - otherNode.X
+		dy := labelY - otherNode.Y
+		if math.Sqrt(dx*dx+dy*dy) < 15 {
+			return true
+		}
+	}
+
+	// Проверяем пересечение с уже размещёнными метками
+	for otherID, otherOffset := range g.labelOffsets {
+		if otherID == nodeID {
+			continue
+		}
+		otherNode := g.graph.Nodes[otherID]
+		otherLabelX := otherNode.X + otherOffset.x
+		otherLabelY := otherNode.Y + otherOffset.y
+
+		// Получаем размеры другой метки
+		fontFace := g.getFontFace(g.baseFontSize)
+		otherTextWidth, otherTextHeight := text.Measure(otherNode.Name, fontFace, 0)
+		otherPadding := 2.0
+		otherRectWidth := otherTextWidth + 2*otherPadding
+		otherRectHeight := otherTextHeight + otherPadding
+
+		if g.rectanglesIntersect(
+			labelX-rectWidth/2, labelY-rectHeight/2, rectWidth, rectHeight,
+			otherLabelX-otherRectWidth/2, otherLabelY-otherRectHeight/2, otherRectWidth, otherRectHeight,
+		) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// rectanglesIntersect проверяет пересечение двух прямоугольников
+func (g *Game) rectanglesIntersect(x1, y1, w1, h1, x2, y2, w2, h2 float64) bool {
+	return !(x1+w1 < x2 || x2+w2 < x1 || y1+h1 < y2 || y2+h2 < y1)
+}
+
+func (g *Game) hasIntersection(nodeID int, offset struct{ x, y float64 }) bool {
+	node := g.graph.Nodes[nodeID]
+	labelX := node.X + offset.x
+	labelY := node.Y + offset.y
+
+	labelWidth := 100.0
+	labelHeight := 20.0
+
+	// Проверяем пересечение с другими узлами
+	for _, otherNode := range g.graph.Nodes {
+		if otherNode.ID == nodeID {
+			continue
+		}
+
+		dx := labelX - otherNode.X
+		dy := labelY - otherNode.Y
+		distance := math.Sqrt(dx*dx + dy*dy)
+
+		if distance < 15 { // Радиус узла + запас
+			return true
+		}
+	}
+
+	// Проверяем пересечение с другими метками
+	for otherID, otherOffset := range g.labelOffsets {
+		if otherID == nodeID {
+			continue
+		}
+
+		otherNode := g.graph.Nodes[otherID]
+		otherLabelX := otherNode.X + otherOffset.x
+		otherLabelY := otherNode.Y + otherOffset.y
+
+		// Проверяем пересечение прямоугольников
+		if math.Abs(labelX-otherLabelX) < labelWidth && math.Abs(labelY-otherLabelY) < labelHeight {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Получаем шрифт нужного размера
@@ -93,6 +428,74 @@ func (g *Game) Update() error {
 		g.camera.TogglePanning()
 	}
 
+	mx, my := ebiten.CursorPosition()
+	g.mouseX, g.mouseY = float64(mx), float64(my)
+
+	// Toggle map menu: M
+	if inpututil.IsKeyJustPressed(ebiten.KeyM) {
+		g.showMapMenu = !g.showMapMenu
+	}
+
+	// Обработка выбора карты из меню
+	if g.showMapMenu {
+		for i, mapName := range g.availableMaps {
+			if inpututil.IsKeyJustPressed(ebiten.Key0 + ebiten.Key(i%10)) {
+				if i < len(g.availableMaps) {
+					if err := g.loadMap(mapName); err != nil {
+						log.Printf("Error loading map: %v", err)
+					}
+					g.showMapMenu = false
+				}
+			}
+		}
+	}
+
+	// Toggle edit mode: Shift+E
+	if inpututil.IsKeyJustPressed(ebiten.KeyE) && ebiten.IsKeyPressed(ebiten.KeyShift) {
+		g.editMode = !g.editMode
+		g.draggingNodeID = -1
+	}
+
+	// Save: Shift+S
+	if inpututil.IsKeyJustPressed(ebiten.KeyS) && ebiten.IsKeyPressed(ebiten.KeyShift) {
+		g.saveMap(fmt.Sprintf("assets/maps/%s_ready.json", g.currentMap))
+	}
+
+	// Recalculate: Shift+R
+	if inpututil.IsKeyJustPressed(ebiten.KeyR) && ebiten.IsKeyPressed(ebiten.KeyShift) {
+		g.calculateLabelPositions()
+	}
+
+	// Reset label: Delete
+	if inpututil.IsKeyJustPressed(ebiten.KeyDelete) && g.editMode {
+		g.resetHoveredLabel()
+	}
+
+	// Обработка клика по кнопке темы
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+		bufx, bufy := ebiten.CursorPosition()
+		mx, my := float64(bufx), float64(bufy)
+
+		// Координаты должны совпадать с drawThemeToggleButton
+		buttonX := 1920. - 30
+		buttonY := 35.
+
+		// Размер кнопки = размер текста
+		textWidth, textHeight := text.Measure("Light", g.fontFace, 0)
+		padding := 10.0
+		buttonW := textWidth + padding*2
+		buttonH := textHeight + padding*2
+
+		if mx >= buttonX-buttonW/2 && mx <= buttonX+buttonW/2 &&
+			my >= buttonY-buttonH/2 && my <= buttonY+buttonH/2 {
+			g.darkTheme = !g.darkTheme
+		}
+	}
+
+	if g.editMode {
+		g.handleEditModeInput()
+	}
+
 	g.camera.Update()
 
 	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
@@ -102,8 +505,286 @@ func (g *Game) Update() error {
 	return nil
 }
 
+func (g *Game) drawUIBox(screen *ebiten.Image, textStr string, centerX, centerY float64, bgColor, textColor, borderColor color.Color) {
+	// 1. Точно измеряем текст
+	tw, th := text.Measure(textStr, g.fontFace, 0)
+
+	// 2. Фиксированные отступы (в экранных пикселях, чтобы UI не прыгал при зуме)
+	padding := 10.0
+	rectW := tw + padding*2
+	rectH := th + padding*2
+
+	// 3. Центрируем прямоугольник относительно переданных координат
+	rectX := centerX - rectW/2
+	rectY := centerY - rectH/2
+
+	// 4. Рисуем фон и границу
+	vector.FillRect(screen, float32(rectX), float32(rectY), float32(rectW), float32(rectH), bgColor, true)
+	vector.StrokeRect(screen, float32(rectX), float32(rectY), float32(rectW), float32(rectH), 1, borderColor, true)
+
+	// 5. Позиция текста (с учётом baseline шрифта)
+	textX := rectX + padding
+	textY := rectY + padding
+
+	op := &text.DrawOptions{}
+	op.GeoM.Translate(textX, textY)
+	op.ColorScale.ScaleWithColor(textColor)
+	text.Draw(screen, textStr, g.fontFace, op)
+}
+
+func (g *Game) drawMapMenu(screen *ebiten.Image) {
+	if !g.showMapMenu {
+		return
+	}
+
+	menuX := 20.0
+	menuY := 80.0
+	itemHeight := 30.0
+	menuWidth := 250.0
+	menuHeight := float64(len(g.availableMaps))*itemHeight + 20
+
+	// Фон меню
+	vector.FillRect(screen, float32(menuX), float32(menuY), float32(menuWidth), float32(menuHeight),
+		color.RGBA{0, 0, 0, 220}, true)
+	vector.StrokeRect(screen, float32(menuX), float32(menuY), float32(menuWidth), float32(menuHeight),
+		2, color.RGBA{255, 255, 0, 255}, true)
+
+	// Заголовок
+	title := "Select Map (0-9):"
+	op := &text.DrawOptions{}
+	op.GeoM.Translate(menuX+10, menuY+20)
+	op.ColorScale.ScaleWithColor(color.RGBA{255, 255, 0, 255})
+	text.Draw(screen, title, g.fontFace, op)
+
+	// Список карт
+	for i, mapName := range g.availableMaps {
+		y := menuY + 40 + float64(i)*itemHeight
+		key := i % 10
+		highlight := ""
+		if i == 0 {
+			highlight = " [CURRENT]"
+		}
+		label := fmt.Sprintf("  %d. %s%s", key, mapName, highlight)
+
+		// Подсветка текущей карты
+		bgColor := color.RGBA{0, 0, 0, 0}
+		if g.currentMap == mapName {
+			bgColor = color.RGBA{255, 255, 0, 50}
+		}
+		vector.FillRect(screen, float32(menuX+5), float32(y-5), float32(menuWidth-10), 25, bgColor, true)
+
+		op := &text.DrawOptions{}
+		op.GeoM.Translate(menuX+10, y+15)
+		if g.currentMap == mapName {
+			op.ColorScale.ScaleWithColor(color.RGBA{255, 255, 0, 255})
+		} else {
+			op.ColorScale.ScaleWithColor(color.White)
+		}
+		text.Draw(screen, label, g.fontFace, op)
+	}
+
+	// Подсказка
+	hint := "Press M to close"
+	op = &text.DrawOptions{}
+	op.GeoM.Translate(menuX+10, menuY+menuHeight-20)
+	op.ColorScale.ScaleWithColor(color.RGBA{200, 200, 200, 255})
+	text.Draw(screen, hint, g.fontFace, op)
+}
+
+func (g *Game) handleEditModeInput() {
+	// Находим метку под курсором
+	hoveredNodeID := g.findHoveredLabel()
+
+	if g.draggingNodeID != -1 {
+		// Перетаскивание
+		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+			screenX, screenY := g.camera.WorldToScreen(g.graph.Nodes[g.draggingNodeID].X, g.graph.Nodes[g.draggingNodeID].Y)
+
+			offset := g.labelOffsets[g.draggingNodeID]
+			labelScreenX := screenX + offset.x*g.camera.Zoom()
+			labelScreenY := screenY + offset.y*g.camera.Zoom()
+
+			dx := (g.mouseX - labelScreenX) / g.camera.Zoom()
+			dy := (g.mouseY - labelScreenY) / g.camera.Zoom()
+
+			offset.x += dx
+			offset.y += dy
+			g.labelOffsets[g.draggingNodeID] = offset
+		} else {
+			// Отпустили мышь
+			g.draggingNodeID = -1
+		}
+	} else if hoveredNodeID != -1 {
+		// Начинаем перетаскивание
+		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+			g.draggingNodeID = hoveredNodeID
+			screenX, screenY := g.camera.WorldToScreen(g.graph.Nodes[hoveredNodeID].X, g.graph.Nodes[hoveredNodeID].Y)
+
+			offset := g.labelOffsets[hoveredNodeID]
+			labelScreenX := screenX + offset.x*g.camera.Zoom()
+			labelScreenY := screenY + offset.y*g.camera.Zoom()
+
+			g.dragOffsetX = g.mouseX - labelScreenX
+			g.dragOffsetY = g.mouseY - labelScreenY
+		}
+	}
+}
+
+func (g *Game) findHoveredLabel() int {
+	for _, node := range g.graph.Nodes {
+		offset, exists := g.labelOffsets[node.ID]
+		if !exists {
+			continue
+		}
+
+		screenX, screenY := g.camera.WorldToScreen(node.X, node.Y)
+		labelX := screenX + offset.x*g.camera.Zoom()
+		labelY := screenY + offset.y*g.camera.Zoom()
+
+		fontFace := g.getFontFace(g.baseFontSize * g.camera.Zoom())
+		textWidth, textHeight := text.Measure(node.Name, fontFace, 0)
+		padding := 2.0 * g.camera.Zoom()
+		rectWidth := textWidth + 2*padding
+		rectHeight := textHeight + padding
+
+		rectX := labelX - rectWidth/2
+		rectY := labelY - rectHeight/2
+
+		if g.mouseX >= rectX && g.mouseX <= rectX+rectWidth &&
+			g.mouseY >= rectY && g.mouseY <= rectY+rectHeight {
+			return node.ID
+		}
+	}
+	return -1
+}
+
+func (g *Game) resetHoveredLabel() {
+	hoveredID := g.findHoveredLabel()
+	if hoveredID != -1 {
+		delete(g.labelOffsets, hoveredID)
+		// Пересчитываем позицию для этого узла
+		neighbors := g.graph.GetNeighbors(hoveredID)
+		if len(neighbors) > 0 {
+			node := g.graph.Nodes[hoveredID]
+			var dirX, dirY float64
+			for _, neighborID := range neighbors {
+				neighbor := g.graph.Nodes[neighborID]
+				dirX += neighbor.X - node.X
+				dirY += neighbor.Y - node.Y
+			}
+			dirX /= float64(len(neighbors))
+			dirY /= float64(len(neighbors))
+
+			length := math.Sqrt(dirX*dirX + dirY*dirY)
+			if length > 0 {
+				dirX /= length
+				dirY /= length
+			}
+
+			normalX := -dirY
+			normalY := dirX
+			g.labelOffsets[hoveredID] = struct{ x, y float64 }{normalX * 25.0, normalY * 25.0}
+		}
+	}
+}
+
+func (g *Game) saveMap(filename string) {
+	// Собираем данные
+	type LabelOffset struct {
+		X float64 `json:"x"`
+		Y float64 `json:"y"`
+	}
+
+	type NodeWithOffset struct {
+		ID          int          `json:"id"`
+		Name        string       `json:"name"`
+		X           float64      `json:"x"`
+		Y           float64      `json:"y"`
+		LineID      string       `json:"line_id"`
+		Type        int          `json:"type"`
+		Owner       int          `json:"owner"`
+		LabelOffset *LabelOffset `json:"label_offset,omitempty"`
+	}
+
+	type MapData struct {
+		Nodes      []NodeWithOffset  `json:"nodes"`
+		Edges      []graph.EdgeJSON  `json:"edges"`
+		Hubs       []graph.HubJSON   `json:"hubs"`
+		LineColors map[string]string `json:"line_colors"`
+	}
+
+	mapData := MapData{
+		Nodes:      make([]NodeWithOffset, 0, len(g.graph.Nodes)),
+		Edges:      make([]graph.EdgeJSON, 0, len(g.graph.Edges)),
+		Hubs:       make([]graph.HubJSON, 0, len(g.graph.Hubs)),
+		LineColors: g.graph.LineColors,
+	}
+
+	// Сохраняем узлы с label_offset
+	for _, node := range g.graph.Nodes {
+		nodeWithOffset := NodeWithOffset{
+			ID:     node.ID,
+			Name:   node.Name,
+			X:      node.X,
+			Y:      node.Y,
+			LineID: node.LineID,
+			Type:   int(node.Type),
+			Owner:  node.Owner,
+		}
+
+		if offset, exists := g.labelOffsets[node.ID]; exists {
+			nodeWithOffset.LabelOffset = &LabelOffset{
+				X: offset.x,
+				Y: offset.y,
+			}
+		}
+
+		mapData.Nodes = append(mapData.Nodes, nodeWithOffset)
+	}
+
+	// Сохраняем рёбра
+	for _, edge := range g.graph.Edges {
+		mapData.Edges = append(mapData.Edges, graph.EdgeJSON{
+			ID:     edge.ID,
+			From:   edge.From,
+			To:     edge.To,
+			Length: edge.Length,
+			Type:   edge.Type,
+		})
+	}
+
+	// Сохраняем хабы
+	for _, hub := range g.graph.Hubs {
+		mapData.Hubs = append(mapData.Hubs, graph.HubJSON{
+			ID:         hub.ID,
+			Name:       hub.Name,
+			StationIDs: hub.StationIDs,
+		})
+	}
+
+	// Маршалим в JSON
+	output, err := json.MarshalIndent(mapData, "", "  ")
+	if err != nil {
+		log.Printf("Error marshaling map: %v", err)
+		return
+	}
+
+	// Записываем в файл
+	err = os.WriteFile(filename, output, 0644)
+	if err != nil {
+		log.Printf("Error saving map: %v", err)
+		return
+	}
+
+	log.Printf("Map saved to %s", filename)
+}
+
 func (g *Game) Draw(screen *ebiten.Image) {
-	screen.Fill(color.RGBA{20, 20, 25, 255})
+	if g.darkTheme {
+		screen.Fill(color.RGBA{20, 20, 25, 255})
+	} else {
+		screen.Fill(color.RGBA{240, 240, 245, 255})
+	}
 
 	if len(g.graph.Nodes) > 0 {
 		g.drawGraph(screen)
@@ -112,6 +793,134 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	g.drawCameraModeIndicator(screen)
+	g.drawThemeToggleButton(screen)
+	g.drawMapNameIndicator(screen) // <-- Добавлено
+
+	if g.editMode {
+		g.drawEditModeIndicator(screen)
+		g.drawConflictCounter(screen)
+	}
+
+	g.drawMapMenu(screen) // <-- Добавлено
+}
+
+func (g *Game) drawMapNameIndicator(screen *ebiten.Image) {
+	textStr := fmt.Sprintf("Map: %s", g.currentMap)
+	bgColor := color.RGBA{0, 0, 0, 180}
+	textColor := color.RGBA{200, 200, 200, 255}
+
+	g.drawUIBox(screen, textStr, 65, 70, bgColor, textColor, textColor)
+}
+
+func (g *Game) drawEditModeIndicator(screen *ebiten.Image) {
+	bgColor := color.RGBA{255, 200, 0, 200}
+	textColor := color.Black
+	borderColor := color.RGBA{255, 255, 0, 255}
+	g.drawUIBox(screen, "EDIT MODE", 65, 110, bgColor, textColor, borderColor)
+}
+
+func (g *Game) drawConflictCounter(screen *ebiten.Image) {
+	conflicts := g.countConflicts()
+	textStr := fmt.Sprintf("Conflicts: %d", conflicts)
+
+	var bgColor, textColor, borderColor color.Color
+
+	if conflicts == 0 {
+		// Мягкий, приятный для глаз зеленый
+		bgColor = color.RGBA{70, 150, 70, 220}
+		textColor = color.White
+		borderColor = color.RGBA{50, 130, 50, 255}
+	} else {
+		// Мягкий, но заметный красный
+		bgColor = color.RGBA{180, 70, 70, 220}
+		textColor = color.White
+		borderColor = color.RGBA{160, 50, 50, 255}
+	}
+
+	g.drawUIBox(screen, textStr, 1920-120, 35, bgColor, textColor, borderColor)
+}
+
+func (g *Game) countConflicts() int {
+	conflicts := 0
+	for nodeID := range g.labelOffsets {
+		if g.hasLabelConflict(nodeID) {
+			conflicts++
+		}
+	}
+	return conflicts
+}
+
+func (g *Game) hasLabelConflict(nodeID int) bool {
+	node := g.graph.Nodes[nodeID]
+	offset := g.labelOffsets[nodeID]
+
+	labelX := node.X + offset.x
+	labelY := node.Y + offset.y
+
+	fontFace := g.getFontFace(g.baseFontSize)
+	textWidth, textHeight := text.Measure(node.Name, fontFace, 0)
+	padding := 2.0
+	rectWidth := textWidth + 2*padding
+	rectHeight := textHeight + padding
+
+	// Проверяем пересечение с узлами
+	for _, otherNode := range g.graph.Nodes {
+		if otherNode.ID == nodeID {
+			continue
+		}
+		dx := labelX - otherNode.X
+		dy := labelY - otherNode.Y
+		if math.Sqrt(dx*dx+dy*dy) < 15 {
+			return true
+		}
+	}
+
+	// Проверяем пересечение с другими метками
+	for otherID, otherOffset := range g.labelOffsets {
+		if otherID == nodeID {
+			continue
+		}
+		otherNode := g.graph.Nodes[otherID]
+		otherLabelX := otherNode.X + otherOffset.x
+		otherLabelY := otherNode.Y + otherOffset.y
+
+		otherFontFace := g.getFontFace(g.baseFontSize)
+		otherTextWidth, otherTextHeight := text.Measure(otherNode.Name, otherFontFace, 0)
+		otherPadding := 2.0
+		otherRectWidth := otherTextWidth + 2*otherPadding
+		otherRectHeight := otherTextHeight + otherPadding
+
+		if g.rectanglesIntersect(
+			labelX-rectWidth/2, labelY-rectHeight/2, rectWidth, rectHeight,
+			otherLabelX-otherRectWidth/2, otherLabelY-otherRectHeight/2, otherRectWidth, otherRectHeight,
+		) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (g *Game) drawThemeToggleButton(screen *ebiten.Image) {
+	textStr := "Light"
+	if g.darkTheme {
+		textStr = "Dark"
+	}
+
+	// Явно объявляем переменные как color.Color
+	var bgColor, textColor, borderColor color.Color
+
+	if g.darkTheme {
+		bgColor = color.RGBA{50, 50, 50, 100}
+		textColor = color.White
+		borderColor = color.White
+	} else {
+		bgColor = color.RGBA{200, 200, 200, 100}     // Полупрозрачный фон
+		textColor = color.Black                      // Черный текст
+		borderColor = color.RGBA{128, 128, 128, 255} // Серая обводка
+	}
+
+	g.drawUIBox(screen, textStr, 1920-30, 35, bgColor, textColor, borderColor)
 }
 
 type edgeWithLine struct {
@@ -282,14 +1091,19 @@ func (g *Game) drawNode(screen *ebiten.Image, node *graph.Node) {
 	screenX, screenY := g.camera.WorldToScreen(node.X, node.Y)
 	x, y := float32(screenX), float32(screenY)
 
-	// Радиус масштабируется с зумом
-	baseRadius := 12.0
+	baseRadius := 6.0
 	radius := float32(baseRadius * g.camera.Zoom())
 
-	c := data.FactionColors[node.Owner]
+	// Заливка узла цветом линии
+	lineColor := hexToColor(g.graph.LineColors[node.LineID])
+	vector.FillCircle(screen, x, y, radius, color.White, true)
 
-	vector.FillCircle(screen, x, y, radius, c, true)
-	vector.StrokeCircle(screen, x, y, radius, 2, color.White, true)
+	// Чёрная внешняя обводка для контраста
+	vector.StrokeCircle(screen, x, y, radius, 2, color.Black, true)
+
+	// Белая точка в центре
+	centerDotRadius := float32(4.0 * g.camera.Zoom())
+	vector.FillCircle(screen, x, y, centerDotRadius, lineColor, true)
 }
 
 func (g *Game) drawEdge(screen *ebiten.Image, nodeA, nodeB *graph.Node, edge *graph.Edge) {
@@ -312,47 +1126,124 @@ func (g *Game) drawNodeLabel(screen *ebiten.Image, node *graph.Node) {
 		return
 	}
 
-	// 1. Базовый размер шрифта (14pt) и текущий зум
-	baseFontSize := 14.0
+	offset, exists := g.labelOffsets[node.ID]
+	if !exists {
+		return
+	}
+
 	zoom := g.camera.Zoom()
-
-	// 2. Вычисляем текущий размер шрифта
-	currentFontSize := baseFontSize * zoom
-
-	// 3. Получаем шрифт нужного размера (с кэшированием)
+	currentFontSize := g.baseFontSize * zoom
 	fontFace := g.getFontFace(currentFontSize)
 
-	// 4. Измеряем точный размер текста
 	textWidth, textHeight := text.Measure(node.Name, fontFace, 0)
 
-	// 5. Вычисляем размеры прямоугольника
-	padding := 6.0 * zoom
+	padding := 2.0 * zoom
 	rectWidth := textWidth + 2*padding
-	rectHeight := textHeight + 2*padding
+	rectHeight := textHeight + padding // Твоё упрощение
 
-	// 6. Позиция прямоугольника (над узлом)
 	screenX, screenY := g.camera.WorldToScreen(node.X, node.Y)
 	x := float64(screenX)
 	y := float64(screenY)
-	nodeRadius := 12.0 * zoom
-	rectX := x - rectWidth/2
-	rectY := y - nodeRadius - 10*zoom - rectHeight
 
-	// 7. Рисуем прямоугольник
-	vector.FillRect(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), color.RGBA{0, 0, 0, 200}, true)
-	vector.StrokeRect(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), 1, color.RGBA{255, 255, 255, 255}, true)
+	// Координаты прямоугольника подписи
+	rectX := x + offset.x*zoom - rectWidth/2
+	rectY := y + offset.y*zoom - rectHeight/2
 
-	// 8. Точное центрирование текста
+	lineColor := hexToColor(g.graph.LineColors[node.LineID])
+
+	// Определяем цвета
+	hasConflict := g.editMode && g.hasLabelConflict(node.ID)
+	isDragging := g.draggingNodeID == node.ID
+
+	var bgColor, borderColor, textColor color.Color
+
+	if g.darkTheme {
+		bgColor = color.RGBA{0, 0, 0, 0}
+		borderColor = lineColor
+		textColor = color.White
+	} else {
+		bgColor = color.RGBA{240, 240, 245, 0} // Полупрозрачный белый
+		borderColor = lineColor
+		textColor = color.Black // Черный текст
+	}
+
+	if hasConflict {
+		borderColor = color.RGBA{255, 0, 0, 255}
+	}
+	if isDragging {
+		borderColor = color.RGBA{255, 255, 0, 255}
+	}
+
+	// Рисуем прямоугольник
+	if g.editMode {
+		g.drawDashedRect(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), 4, borderColor)
+	} else {
+		// Рисуем фон ТОЛЬКО если альфа > 0
+		bgRGBA, ok := bgColor.(color.RGBA)
+		if ok && bgRGBA.A > 0 {
+			vector.FillRect(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), bgColor, true)
+		}
+
+		vector.StrokeRect(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), 1, borderColor, true)
+	}
+
+	// Рисуем текст
 	textX := rectX + padding
-	textY := rectY + padding + (textHeight * 0.5) // Точное вертикальное центрирование
+	textY := rectY + padding
 
-	// 9. Настраиваем опции отрисовки
 	op := &text.DrawOptions{}
 	op.GeoM.Translate(textX, textY)
-	op.ColorScale.ScaleWithColor(color.White)
-
-	// 10. Рисуем текст
+	op.ColorScale.ScaleWithColor(textColor)
 	text.Draw(screen, node.Name, fontFace, op)
+
+	// ==========================================================
+	// Рисуем линию связи от узла к подписи
+	// ==========================================================
+
+	// 1. Находим ближайшую точку на прямоугольнике подписи к центру узла
+	// (Используем clamp: ограничиваем координаты центра узла границами прямоугольника)
+	closestX := math.Max(float64(rectX), math.Min(x, float64(rectX+rectWidth)))
+	closestY := math.Max(float64(rectY), math.Min(y, float64(rectY+rectHeight)))
+
+	// 2. Вычисляем вектор от центра узла к этой ближайшей точке
+	dx := closestX - x
+	dy := closestY - y
+	dist := math.Sqrt(dx*dx + dy*dy)
+
+	// 3. Если расстояние больше 0, рисуем линию от КРАЯ узла (а не от центра)
+	if dist > 0 {
+		nodeRadius := 12.0 * zoom
+		startX := x + (dx/dist)*nodeRadius
+		startY := y + (dy/dist)*nodeRadius
+
+		// Рисуем линию связи тем же цветом, что и граница
+		lineColor := hexToColor(g.graph.LineColors[node.LineID])
+		vector.StrokeLine(screen, float32(startX), float32(startY), float32(closestX), float32(closestY), 1.5, lineColor, true)
+	}
+}
+
+func (g *Game) drawDashedRect(screen *ebiten.Image, x, y, w, h float32, dashLength int, c color.Color) {
+	// Рисуем пунктирную рамку
+	// Верхняя линия
+	for i := 0; i < int(w); i += dashLength * 2 {
+		length := math.Min(float64(dashLength), float64(int(w)-i))
+		vector.StrokeLine(screen, x+float32(i), y, x+float32(i)+float32(length), y, 1, c, true)
+	}
+	// Правая линия
+	for i := 0; i < int(h); i += dashLength * 2 {
+		length := math.Min(float64(dashLength), float64(int(h)-i))
+		vector.StrokeLine(screen, x+w, y+float32(i), x+w, y+float32(i)+float32(length), 1, c, true)
+	}
+	// Нижняя линия
+	for i := 0; i < int(w); i += dashLength * 2 {
+		length := math.Min(float64(dashLength), float64(int(w)-i))
+		vector.StrokeLine(screen, x+float32(i), y+h, x+float32(i)+float32(length), y+h, 1, c, true)
+	}
+	// Левая линия
+	for i := 0; i < int(h); i += dashLength * 2 {
+		length := math.Min(float64(dashLength), float64(int(h)-i))
+		vector.StrokeLine(screen, x, y+float32(i), x, y+float32(i)+float32(length), 1, c, true)
+	}
 }
 
 func (g *Game) drawHub(screen *ebiten.Image, hub *graph.Hub) {

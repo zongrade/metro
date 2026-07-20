@@ -2,8 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -69,18 +70,50 @@ type HubJSON struct {
 	StationIDs []int  `json:"station_ids"`
 }
 
-const MOSCOW = "https://api.hh.ru/metro/1"
-const MINSK = "https://api.hh.ru/metro/1002"
+type MapDescription struct {
+	name string
+	url  string
+}
+
+var availableMaps = []MapDescription{
+	{name: "Minsk", url: "https://api.hh.ru/metro/1002"},
+	{name: "Moscow", url: "https://api.hh.ru/metro/1"},
+}
 
 func main() {
-	resp, err := http.Get(MINSK)
+	// Флаг для выбора города. По умолчанию Minsk.
+	cityFlag := flag.String("city", "Minsk", "City name to generate (e.g., Minsk, Moscow)")
+	flag.Parse()
+
+	// Ищем запрошенный город
+	var target MapDescription
+	found := false
+	for _, m := range availableMaps {
+		if m.name == *cityFlag {
+			target = m
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		fmt.Printf("City '%s' not found.\nAvailable cities: ", *cityFlag)
+		for _, m := range availableMaps {
+			fmt.Printf("%s ", m.name)
+		}
+		fmt.Println()
+		os.Exit(1)
+	}
+
+	fmt.Printf("Fetching data for %s from %s...\n", target.name, target.url)
+	resp, err := http.Get(target.url)
 	if err != nil {
 		fmt.Printf("Error fetching API: %v\n", err)
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Printf("Error reading response: %v\n", err)
 		os.Exit(1)
@@ -110,13 +143,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = os.WriteFile("assets/maps/test_map.json", output, 0644)
+	filename := fmt.Sprintf("assets/maps/%s.json", target.name)
+	err = os.WriteFile(filename, output, 0644)
 	if err != nil {
 		fmt.Printf("Error writing file: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("\nMap generated successfully!")
+	fmt.Printf("\nMap '%s' generated successfully and saved to %s!\n", target.name, filename)
 	fmt.Printf("Total stations: %d\n", len(mapData.Nodes))
 }
 

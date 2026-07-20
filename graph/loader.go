@@ -14,13 +14,19 @@ type MapData struct {
 }
 
 type NodeJSON struct {
-	ID     int     `json:"id"`
-	Name   string  `json:"name"`
-	X      float64 `json:"x"`
-	Y      float64 `json:"y"`
-	LineID string  `json:"line_id"` // Изменили на string
-	Type   int     `json:"type"`
-	Owner  int     `json:"owner"`
+	ID          int          `json:"id"`
+	Name        string       `json:"name"`
+	X           float64      `json:"x"`
+	Y           float64      `json:"y"`
+	LineID      string       `json:"line_id"`
+	Type        int          `json:"type"`
+	Owner       int          `json:"owner"`
+	LabelOffset *LabelOffset `json:"label_offset,omitempty"`
+}
+
+type LabelOffset struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
 }
 
 type EdgeJSON struct {
@@ -65,6 +71,12 @@ func ParseMap(jsonBytes []byte) (*Graph, error) {
 			data.NodeType(nodeJSON.Type),
 		)
 		node.Owner = nodeJSON.Owner
+		if nodeJSON.LabelOffset != nil {
+			g.NodeLabelOffsets[node.ID] = struct{ X, Y float64 }{
+				X: nodeJSON.LabelOffset.X,
+				Y: nodeJSON.LabelOffset.Y,
+			}
+		}
 		g.AddNode(node)
 	}
 

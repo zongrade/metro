@@ -6,18 +6,20 @@ type Graph struct {
 	Hubs       map[int]*Hub
 	LineColors map[string]string // line_id -> hex_color
 	// Индексы для быстрого поиска
-	NodeEdges map[int][]int // ID узла -> список ID рёбер
-	HubNodes  map[int][]int // ID узла -> ID хаба (если есть)
+	NodeEdges        map[int][]int // ID узла -> список ID рёбер
+	HubNodes         map[int][]int // ID узла -> ID хаба (если есть)
+	NodeLabelOffsets map[int]struct{ X, Y float64 }
 }
 
 func NewGraph() *Graph {
 	return &Graph{
-		Nodes:      make(map[int]*Node),
-		Edges:      make(map[int]*Edge),
-		Hubs:       make(map[int]*Hub),
-		LineColors: make(map[string]string),
-		NodeEdges:  make(map[int][]int),
-		HubNodes:   make(map[int][]int),
+		Nodes:            make(map[int]*Node),
+		Edges:            make(map[int]*Edge),
+		Hubs:             make(map[int]*Hub),
+		LineColors:       make(map[string]string),
+		NodeEdges:        make(map[int][]int),
+		HubNodes:         make(map[int][]int),
+		NodeLabelOffsets: make(map[int]struct{ X, Y float64 }),
 	}
 }
 
