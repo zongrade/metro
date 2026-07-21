@@ -4,6 +4,7 @@ import (
 	"embed"
 	"log"
 
+	"metro-wars/cliargs"
 	"metro-wars/game"
 
 	"github.com/hajimehoshi/ebiten/v2"
@@ -16,6 +17,8 @@ var MapsFS embed.FS
 var FontsFS embed.FS
 
 func main() {
+	cliargs.ParseAll()
+
 	g, err := game.New(MapsFS, FontsFS)
 	if err != nil {
 		log.Fatal("Failed to create game:", err)

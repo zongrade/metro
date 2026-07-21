@@ -4,6 +4,7 @@ import (
 	"embed"
 	"encoding/json"
 	"metro-wars/data"
+	"os"
 )
 
 type MapData struct {
@@ -41,6 +42,15 @@ type HubJSON struct {
 	ID         int    `json:"id"`
 	Name       string `json:"name"`
 	StationIDs []int  `json:"station_ids"`
+}
+
+// LoadMapFromFile загружает карту из обычного файла на диске
+func LoadMapFromFile(path string) (*Graph, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseMap(data)
 }
 
 func LoadMap(fs embed.FS, filename string) (*Graph, error) {

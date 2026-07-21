@@ -9,12 +9,15 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"metro-wars/camera"
+	"metro-wars/cliargs"
 	"metro-wars/graph"
 
+	"github.com/erparts/go-shapes"
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/text/v2"
@@ -44,6 +47,8 @@ type Game struct {
 	availableMaps []string // Список доступных карт
 	currentMap    string   // Текущая карта (без .json)
 	showMapMenu   bool     // Показать меню выбора
+
+	shapeRenderer *shapes.Renderer
 }
 
 func (g *Game) scanAvailableMaps() error {
@@ -76,41 +81,54 @@ func (g *Game) scanAvailableMaps() error {
 }
 
 func (g *Game) loadMap(mapName string) error {
-	// Сначала пробуем загрузить _ready версию из файловой системы
-	readyFilename := fmt.Sprintf("assets/maps/%s_ready.json", mapName)
-	readyData, err := os.ReadFile(readyFilename)
+	var err error
 
-	if err == nil {
-		// _ready файл существует, загружаем его
-		g.graph, err = graph.ParseMap(readyData)
-		if err != nil {
-			return fmt.Errorf("failed to parse ready map %s: %v", mapName, err)
+	// 1. Пробуем загрузить _ready.json из файловой системы (рядом с бинарником)
+	readyFile := fmt.Sprintf("assets/maps/%s_ready.json", mapName)
+	if _, statErr := os.Stat(readyFile); statErr == nil {
+		g.graph, err = graph.LoadMapFromFile(readyFile)
+		if err == nil {
+			log.Printf("Loaded ready map from file system: %s", readyFile)
+			g.finalizeMapLoad(mapName)
+			return nil
 		}
-		log.Printf("Loaded ready map: %s", readyFilename)
-	} else {
-		// _ready файл не найден, загружаем оригинал из embed
-		filename := fmt.Sprintf("assets/maps/%s.json", mapName)
-		g.graph, err = graph.LoadMap(g.mapsFS, filename)
-		if err != nil {
-			return fmt.Errorf("failed to load map %s: %v", mapName, err)
-		}
-		log.Printf("Loaded original map: %s", filename)
 	}
 
-	// Загружаем сохранённые смещения, если есть
+	// 2. Пробуем загрузить _ready.json из embed FS
+	readyEmbed := fmt.Sprintf("assets/maps/%s_ready.json", mapName)
+	if _, readErr := g.mapsFS.ReadFile(readyEmbed); readErr == nil {
+		g.graph, err = graph.LoadMap(g.mapsFS, readyEmbed)
+		if err == nil {
+			log.Printf("Loaded ready map from embed: %s", readyEmbed)
+			g.finalizeMapLoad(mapName)
+			return nil
+		}
+	}
+
+	// 3. Загружаем обычный .json из embed FS
+	filename := fmt.Sprintf("assets/maps/%s.json", mapName)
+	g.graph, err = graph.LoadMap(g.mapsFS, filename)
+	if err != nil {
+		return fmt.Errorf("failed to load map %s: %v", mapName, err)
+	}
+	log.Printf("Loaded original map from embed: %s", filename)
+
+	g.finalizeMapLoad(mapName)
+	return nil
+}
+
+// Вынес общую логику в отдельную функцию
+func (g *Game) finalizeMapLoad(mapName string) {
 	g.labelOffsets = make(map[int]struct{ x, y float64 })
 	for id, offset := range g.graph.NodeLabelOffsets {
 		g.labelOffsets[id] = struct{ x, y float64 }{x: offset.X, y: offset.Y}
 	}
 
-	// Если смещений нет, рассчитываем
 	if len(g.labelOffsets) == 0 {
 		g.calculateLabelPositions()
 	}
 
 	g.currentMap = mapName
-	log.Printf("Loaded map: %s", mapName)
-	return nil
 }
 
 func New(mapsFS embed.FS, fontsFS embed.FS) (*Game, error) {
@@ -124,6 +142,7 @@ func New(mapsFS embed.FS, fontsFS embed.FS) (*Game, error) {
 		labelOffsets:   make(map[int]struct{ x, y float64 }),
 		draggingNodeID: -1,
 		showMapMenu:    false,
+		shapeRenderer:  shapes.NewRenderer(),
 	}
 
 	// Загружаем карту
@@ -135,7 +154,6 @@ func New(mapsFS embed.FS, fontsFS embed.FS) (*Game, error) {
 	}
 
 	g.currentMap = g.availableMaps[0] // Первая карта по умолчанию
-
 	// Загружаем первую карту
 	if err := g.loadMap(g.currentMap); err != nil {
 		log.Printf("Warning: Could not load map: %v", err)
@@ -436,20 +454,6 @@ func (g *Game) Update() error {
 		g.showMapMenu = !g.showMapMenu
 	}
 
-	// Обработка выбора карты из меню
-	if g.showMapMenu {
-		for i, mapName := range g.availableMaps {
-			if inpututil.IsKeyJustPressed(ebiten.Key0 + ebiten.Key(i%10)) {
-				if i < len(g.availableMaps) {
-					if err := g.loadMap(mapName); err != nil {
-						log.Printf("Error loading map: %v", err)
-					}
-					g.showMapMenu = false
-				}
-			}
-		}
-	}
-
 	// Toggle edit mode: Shift+E
 	if inpututil.IsKeyJustPressed(ebiten.KeyE) && ebiten.IsKeyPressed(ebiten.KeyShift) {
 		g.editMode = !g.editMode
@@ -490,6 +494,41 @@ func (g *Game) Update() error {
 			my >= buttonY-buttonH/2 && my <= buttonY+buttonH/2 {
 			g.darkTheme = !g.darkTheme
 		}
+
+		if mx > 19 && mx < 110 && my > 52 && my < 87 {
+
+			g.showMapMenu = !g.showMapMenu
+		}
+
+		// выбор карты
+		{
+			menuX := 20.0
+			menuY := 90.0
+			if g.editMode {
+				menuY = 130.0
+			}
+
+			itemHeight := 30.0
+			gap := 4.0
+			totalItemHeight := itemHeight + gap
+			menuWidth := 150.0
+
+			for i, mapName := range g.availableMaps {
+				itemY := menuY + 40.0 + float64(i)*totalItemHeight
+
+				// Та же логика, что и в drawMapMenu
+				if g.mouseX >= menuX && g.mouseX <= menuX+menuWidth &&
+					g.mouseY >= itemY && g.mouseY < itemY+itemHeight {
+
+					if err := g.loadMap(mapName); err != nil {
+						log.Printf("Error loading map: %v", err)
+					}
+					g.showMapMenu = false
+					break // Выходим из цикла после успешного выбора
+				}
+			}
+
+		}
 	}
 
 	if g.editMode {
@@ -518,9 +557,28 @@ func (g *Game) drawUIBox(screen *ebiten.Image, textStr string, centerX, centerY 
 	rectX := centerX - rectW/2
 	rectY := centerY - rectH/2
 
-	// 4. Рисуем фон и границу
-	vector.FillRect(screen, float32(rectX), float32(rectY), float32(rectW), float32(rectH), bgColor, true)
-	vector.StrokeRect(screen, float32(rectX), float32(rectY), float32(rectW), float32(rectH), 1, borderColor, true)
+	outerRounding := float32(6.0)
+	thickness := float32(1.0)
+	innerRounding := outerRounding - thickness
+
+	// 1. Внешняя граница
+	borderRGBA, ok := borderColor.(color.RGBA)
+	if ok && borderRGBA.A > 0 {
+		g.shapeRenderer.SetColor(borderColor)
+		g.shapeRenderer.DrawArea(screen, float32(rectX), float32(rectY), float32(rectW), float32(rectH), outerRounding)
+	}
+
+	// 2. Внутренний фон
+	bgRGBA, ok := bgColor.(color.RGBA)
+	if ok && bgRGBA.A > 0 {
+		g.shapeRenderer.SetColor(bgColor)
+		g.shapeRenderer.DrawArea(screen,
+			float32(rectX)+thickness,
+			float32(rectY)+thickness,
+			float32(rectW)-2*thickness,
+			float32(rectH)-2*thickness,
+			innerRounding)
+	}
 
 	// 5. Позиция текста (с учётом baseline шрифта)
 	textX := rectX + padding
@@ -538,57 +596,82 @@ func (g *Game) drawMapMenu(screen *ebiten.Image) {
 	}
 
 	menuX := 20.0
-	menuY := 80.0
-	itemHeight := 30.0
-	menuWidth := 250.0
-	menuHeight := float64(len(g.availableMaps))*itemHeight + 20
+	menuY := 90.0
+	if g.editMode {
+		menuY = 130.
+	}
 
-	// Фон меню
-	vector.FillRect(screen, float32(menuX), float32(menuY), float32(menuWidth), float32(menuHeight),
-		color.RGBA{0, 0, 0, 220}, true)
-	vector.StrokeRect(screen, float32(menuX), float32(menuY), float32(menuWidth), float32(menuHeight),
-		2, color.RGBA{255, 255, 0, 255}, true)
+	itemHeight := 30.0
+	gap := 4.0
+	totalItemHeight := itemHeight + gap
+
+	menuWidth := 150.0
+	menuHeight := float64(len(g.availableMaps))*totalItemHeight + 40
+
+	// Фон всего меню
+	if g.darkTheme {
+		vector.FillRect(screen, float32(menuX), float32(menuY), float32(menuWidth), float32(menuHeight), color.RGBA{50, 50, 50, 100}, true)
+	} else {
+		vector.FillRect(screen, float32(menuX), float32(menuY), float32(menuWidth), float32(menuHeight), color.RGBA{200, 200, 200, 100}, true)
+	}
+	// Граница меню
+	if g.darkTheme {
+		vector.StrokeRect(screen, float32(menuX), float32(menuY), float32(menuWidth), float32(menuHeight), 2, color.RGBA{255, 255, 0, 255}, true)
+	} else {
+		vector.StrokeRect(screen, float32(menuX), float32(menuY), float32(menuWidth), float32(menuHeight), 2, color.RGBA{96, 124, 196, 255}, true)
+	}
 
 	// Заголовок
-	title := "Select Map (0-9):"
 	op := &text.DrawOptions{}
-	op.GeoM.Translate(menuX+10, menuY+20)
-	op.ColorScale.ScaleWithColor(color.RGBA{255, 255, 0, 255})
-	text.Draw(screen, title, g.fontFace, op)
+	op.GeoM.Translate(menuX+10, menuY+10)
+	if g.darkTheme {
+		op.ColorScale.ScaleWithColor(color.RGBA{255, 255, 0, 255})
+	} else {
+		op.ColorScale.ScaleWithColor(color.RGBA{96, 124, 196, 255})
+	}
+	text.Draw(screen, "Select Map (Click):", g.fontFace, op)
 
 	// Список карт
 	for i, mapName := range g.availableMaps {
-		y := menuY + 40 + float64(i)*itemHeight
-		key := i % 10
-		highlight := ""
-		if i == 0 {
-			highlight = " [CURRENT]"
-		}
-		label := fmt.Sprintf("  %d. %s%s", key, mapName, highlight)
+		itemY := menuY + 30 + float64(i)*totalItemHeight
 
-		// Подсветка текущей карты
-		bgColor := color.RGBA{0, 0, 0, 0}
-		if g.currentMap == mapName {
-			bgColor = color.RGBA{255, 255, 0, 50}
+		// Проверяем наведение мыши
+		isHovered := g.mouseX >= menuX && g.mouseX <= menuX+menuWidth &&
+			g.mouseY >= itemY && g.mouseY <= itemY+itemHeight
+
+		// Подсветка при наведении
+		if isHovered {
+			if g.darkTheme {
+				vector.FillRect(screen, float32(menuX+5), float32(itemY), float32(menuWidth-10), float32(itemHeight), color.RGBA{100, 100, 0, 10}, true)
+			} else {
+				vector.FillRect(screen, float32(menuX+5), float32(itemY), float32(menuWidth-10), float32(itemHeight), color.RGBA{96, 124, 196, 150}, true)
+			}
 		}
-		vector.FillRect(screen, float32(menuX+5), float32(y-5), float32(menuWidth-10), 25, bgColor, true)
+
+		// Текст элемента
+		label := fmt.Sprintf("  %s", mapName)
+		if g.currentMap == mapName {
+			label = fmt.Sprintf("► %s", mapName)
+		}
 
 		op := &text.DrawOptions{}
-		op.GeoM.Translate(menuX+10, y+15)
+		//op.GeoM.Translate(menuX+10, itemY+20) // +20 для вертикального центрирования в itemHeight=30
+		op.GeoM.Translate(menuX+10, itemY+7) // +20 для вертикального центрирования в itemHeight=30
+
 		if g.currentMap == mapName {
-			op.ColorScale.ScaleWithColor(color.RGBA{255, 255, 0, 255})
+			if g.darkTheme {
+				op.ColorScale.ScaleWithColor(color.RGBA{255, 255, 0, 255})
+			} else {
+				op.ColorScale.ScaleWithColor(color.RGBA{96, 124, 196, 255})
+			}
+		} else if isHovered {
+			op.ColorScale.ScaleWithColor(color.RGBA{0, 150, 0, 255})
 		} else {
-			op.ColorScale.ScaleWithColor(color.White)
+			op.ColorScale.ScaleWithColor(color.RGBA{200, 200, 200, 255})
 		}
+
 		text.Draw(screen, label, g.fontFace, op)
 	}
-
-	// Подсказка
-	hint := "Press M to close"
-	op = &text.DrawOptions{}
-	op.GeoM.Translate(menuX+10, menuY+menuHeight-20)
-	op.ColorScale.ScaleWithColor(color.RGBA{200, 200, 200, 255})
-	text.Draw(screen, hint, g.fontFace, op)
 }
 
 func (g *Game) handleEditModeInput() {
@@ -689,32 +772,8 @@ func (g *Game) resetHoveredLabel() {
 }
 
 func (g *Game) saveMap(filename string) {
-	// Собираем данные
-	type LabelOffset struct {
-		X float64 `json:"x"`
-		Y float64 `json:"y"`
-	}
-
-	type NodeWithOffset struct {
-		ID          int          `json:"id"`
-		Name        string       `json:"name"`
-		X           float64      `json:"x"`
-		Y           float64      `json:"y"`
-		LineID      string       `json:"line_id"`
-		Type        int          `json:"type"`
-		Owner       int          `json:"owner"`
-		LabelOffset *LabelOffset `json:"label_offset,omitempty"`
-	}
-
-	type MapData struct {
-		Nodes      []NodeWithOffset  `json:"nodes"`
-		Edges      []graph.EdgeJSON  `json:"edges"`
-		Hubs       []graph.HubJSON   `json:"hubs"`
-		LineColors map[string]string `json:"line_colors"`
-	}
-
-	mapData := MapData{
-		Nodes:      make([]NodeWithOffset, 0, len(g.graph.Nodes)),
+	mapData := graph.MapData{
+		Nodes:      make([]graph.NodeJSON, 0, len(g.graph.Nodes)),
 		Edges:      make([]graph.EdgeJSON, 0, len(g.graph.Edges)),
 		Hubs:       make([]graph.HubJSON, 0, len(g.graph.Hubs)),
 		LineColors: g.graph.LineColors,
@@ -722,7 +781,7 @@ func (g *Game) saveMap(filename string) {
 
 	// Сохраняем узлы с label_offset
 	for _, node := range g.graph.Nodes {
-		nodeWithOffset := NodeWithOffset{
+		nodeWithOffset := graph.NodeJSON{
 			ID:     node.ID,
 			Name:   node.Name,
 			X:      node.X,
@@ -733,7 +792,7 @@ func (g *Game) saveMap(filename string) {
 		}
 
 		if offset, exists := g.labelOffsets[node.ID]; exists {
-			nodeWithOffset.LabelOffset = &LabelOffset{
+			nodeWithOffset.LabelOffset = &graph.LabelOffset{
 				X: offset.x,
 				Y: offset.y,
 			}
@@ -769,6 +828,13 @@ func (g *Game) saveMap(filename string) {
 		return
 	}
 
+	// 1. Создаём директорию, если её нет
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("Error creating directory %s: %v", dir, err)
+		return
+	}
+
 	// Записываем в файл
 	err = os.WriteFile(filename, output, 0644)
 	if err != nil {
@@ -794,14 +860,15 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	g.drawCameraModeIndicator(screen)
 	g.drawThemeToggleButton(screen)
-	g.drawMapNameIndicator(screen) // <-- Добавлено
+	g.drawMapNameIndicator(screen)
 
 	if g.editMode {
 		g.drawEditModeIndicator(screen)
 		g.drawConflictCounter(screen)
 	}
 
-	g.drawMapMenu(screen) // <-- Добавлено
+	g.drawMapMenu(screen)
+	g.drawDebugInfo(screen)
 }
 
 func (g *Game) drawMapNameIndicator(screen *ebiten.Image) {
@@ -817,6 +884,21 @@ func (g *Game) drawEditModeIndicator(screen *ebiten.Image) {
 	textColor := color.Black
 	borderColor := color.RGBA{255, 255, 0, 255}
 	g.drawUIBox(screen, "EDIT MODE", 65, 110, bgColor, textColor, borderColor)
+}
+
+func (g *Game) drawDebugInfo(screen *ebiten.Image) {
+	if !cliargs.DEBUG {
+		return
+	}
+
+	debugText := fmt.Sprintf("Cursor: X:%.0f Y:%.0f", g.mouseX, g.mouseY)
+
+	// Рисуем в правом нижнем углу или рядом с другими индикаторами
+	bgColor := color.RGBA{0, 0, 0, 180}
+	textColor := color.RGBA{0, 255, 0, 255} // Зелёный для отладки
+	borderColor := color.RGBA{0, 255, 0, 255}
+
+	g.drawUIBox(screen, debugText, 1920-120, 80, bgColor, textColor, borderColor)
 }
 
 func (g *Game) drawConflictCounter(screen *ebiten.Image) {
@@ -1158,11 +1240,13 @@ func (g *Game) drawNodeLabel(screen *ebiten.Image, node *graph.Node) {
 	var bgColor, borderColor, textColor color.Color
 
 	if g.darkTheme {
-		bgColor = color.RGBA{0, 0, 0, 0}
+		//bgColor = color.RGBA{0, 0, 0, 0}
+		bgColor = color.RGBA{20, 20, 25, 255}
 		borderColor = lineColor
 		textColor = color.White
 	} else {
-		bgColor = color.RGBA{240, 240, 245, 0} // Полупрозрачный белый
+		//bgColor = color.RGBA{240, 240, 245, 0} // Полупрозрачный белый
+		bgColor = color.RGBA{240, 240, 245, 255} // Полупрозрачный белый
 		borderColor = lineColor
 		textColor = color.Black // Черный текст
 	}
@@ -1174,17 +1258,37 @@ func (g *Game) drawNodeLabel(screen *ebiten.Image, node *graph.Node) {
 		borderColor = color.RGBA{255, 255, 0, 255}
 	}
 
-	// Рисуем прямоугольник
+	// Рисуем прямоугольник со скруглёнными углами через go-shapes
 	if g.editMode {
+		// В режиме редактирования пока оставим пунктирную рамку (или можно применить тот же трюк)
 		g.drawDashedRect(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), 4, borderColor)
 	} else {
-		// Рисуем фон ТОЛЬКО если альфа > 0
-		bgRGBA, ok := bgColor.(color.RGBA)
-		if ok && bgRGBA.A > 0 {
-			vector.FillRect(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), bgColor, true)
+		thickness := float32(1.0)
+		outerRounding := float32(5.0) * float32(zoom)
+		innerRounding := outerRounding - thickness
+		if innerRounding < 0 {
+			innerRounding = 0
 		}
 
-		vector.StrokeRect(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), 1, borderColor, true)
+		// 1. Рисуем внешнюю границу (если её альфа > 0)
+		borderRGBA, ok := borderColor.(color.RGBA)
+		if ok && borderRGBA.A > 0 {
+			g.shapeRenderer.SetColor(borderColor)
+			g.shapeRenderer.DrawArea(screen, float32(rectX), float32(rectY), float32(rectWidth), float32(rectHeight), outerRounding)
+		}
+
+		// 2. Рисуем внутренний фон (если его альфа > 0)
+		bgRGBA, ok := bgColor.(color.RGBA)
+		if ok && bgRGBA.A > 0 {
+			g.shapeRenderer.SetColor(bgColor)
+			// Внутренние координаты смещены на thickness, размеры уменьшены на 2*thickness
+			g.shapeRenderer.DrawArea(screen,
+				float32(rectX)+thickness,
+				float32(rectY)+thickness,
+				float32(rectWidth)-2*thickness,
+				float32(rectHeight)-2*thickness,
+				innerRounding)
+		}
 	}
 
 	// Рисуем текст
