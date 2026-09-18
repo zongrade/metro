@@ -13,9 +13,9 @@ import (
 	"sort"
 	"strings"
 
-	"metro-wars/camera"
-	"metro-wars/cliargs"
-	"metro-wars/graph"
+	"metro/camera"
+	"metro/cliargs"
+	"metro/graph"
 
 	"github.com/erparts/go-shapes"
 	"github.com/hajimehoshi/ebiten/v2"

@@ -1,4 +1,4 @@
-module metro-wars
+module metro
 
 go 1.26.5
 

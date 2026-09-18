@@ -4,13 +4,13 @@ import (
 	"embed"
 	"log"
 
-	"metro-wars/cliargs"
-	"metro-wars/game"
+	"metro/cliargs"
+	"metro/game"
 
 	"github.com/hajimehoshi/ebiten/v2"
 )
 
-//go:embed assets/maps/*.json
+//go:embed assets/maps/*/*.json
 var MapsFS embed.FS
 
 //go:embed assets/fonts/*.ttf

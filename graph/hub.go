@@ -1,6 +1,6 @@
 package graph
 
-import "metro-wars/data"
+import "metro/data"
 
 type Hub struct {
 	ID         int          `json:"id"`

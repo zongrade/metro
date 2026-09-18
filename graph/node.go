@@ -1,13 +1,13 @@
 package graph
 
-import "metro-wars/data"
+import "metro/data"
 
 type Node struct {
 	ID           int                `json:"id"`
 	Name         string             `json:"name"`
 	X            float64            `json:"x"`
 	Y            float64            `json:"y"`
-	LineID       string             `json:"line_id"` // Изменили с int на string
+	LineID       string             `json:"line_id"`
 	Type         data.NodeType      `json:"type"`
 	Level        int                `json:"level"`
 	Owner        int                `json:"owner"`
@@ -27,7 +27,7 @@ func NewNode(id int, name string, x, y float64, lineID string, nodeType data.Nod
 		Name:       name,
 		X:          x,
 		Y:          y,
-		LineID:     lineID, // Теперь string
+		LineID:     lineID,
 		Type:       nodeType,
 		Level:      1,
 		Owner:      0,

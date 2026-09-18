@@ -6,10 +6,53 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"metro/graph"
 	"net/http"
 	"os"
 	"sort"
 )
+
+// --- Структуры для Yandex APK (сокращённо, основные поля) ---
+type YandexData struct {
+	Services struct {
+		Items []struct {
+			ID         string `json:"id"`
+			Attributes struct {
+				Color string `json:"color"`
+			} `json:"attributes"`
+		} `json:"items"`
+	} `json:"services"`
+	Stations struct {
+		Items []struct {
+			ID         string `json:"id"`
+			Attributes struct {
+				GeoPoint  struct{ Lat, Lon float64 } `json:"geoPoint"`
+				LegacyIDs []string                   `json:"legacyIds"`
+			} `json:"attributes"`
+		} `json:"items"`
+	} `json:"stations"`
+	Stops struct {
+		Items []struct {
+			NodeID    string `json:"nodeId"`
+			StationID string `json:"stationId"`
+		} `json:"items"`
+	} `json:"stops"`
+	Links struct {
+		Items []struct {
+			FromNodeID string `json:"fromNodeId"`
+			ToNodeID   string `json:"toNodeId"`
+			Attributes struct {
+				Time int `json:"time"`
+			} `json:"attributes"`
+		} `json:"items"`
+	} `json:"links"`
+}
+
+type YandexL10n struct {
+	Keysets struct {
+		Generated map[string]map[string]string `json:"generated"`
+	} `json:"keysets"`
+}
 
 type MetroAPI struct {
 	ID    string `json:"id"`
@@ -39,36 +82,37 @@ type LineRef struct {
 	Name     string `json:"name"`
 }
 
-type MapData struct {
-	Nodes      []NodeJSON        `json:"nodes"`
-	Edges      []EdgeJSON        `json:"edges"`
-	Hubs       []HubJSON         `json:"hubs"`
-	LineColors map[string]string `json:"line_colors"`
-}
+//type MapData struct {
+//	Nodes      []NodeJSON        `json:"nodes"`
+//	Edges      []EdgeJSON        `json:"edges"`
+//	Hubs       []HubJSON         `json:"hubs"`
+//	LineColors map[string]string `json:"line_colors"`
+//}
 
-type NodeJSON struct {
-	ID     int     `json:"id"`
-	Name   string  `json:"name"`
-	X      float64 `json:"x"`
-	Y      float64 `json:"y"`
-	LineID string  `json:"line_id"`
-	Type   int     `json:"type"`
-	Owner  int     `json:"owner"`
-}
+//type NodeJSON struct {
+//	ID     int     `json:"id"`
+//	Name   string  `json:"name"`
+//	X      float64 `json:"x"`
+//	Y      float64 `json:"y"`
+//	LineID string  `json:"line_id"`
+//	Type   int     `json:"type"`
+//	Owner  int     `json:"owner"`
+//}
 
-type EdgeJSON struct {
-	ID     int    `json:"id"`
-	From   int    `json:"from"`
-	To     int    `json:"to"`
-	Length int    `json:"length"`
-	Type   string `json:"type"`
-}
+//type EdgeJSON struct {
+//	ID     int    `json:"id"`
+//	From   int    `json:"from"`
+//	To     int    `json:"to"`
+//	Length int    `json:"length"`
+//	Type   string `json:"type"`
+//	Time   int    `json:"time"`
+//}
 
-type HubJSON struct {
-	ID         int    `json:"id"`
-	Name       string `json:"name"`
-	StationIDs []int  `json:"station_ids"`
-}
+//type HubJSON struct {
+//	ID         int    `json:"id"`
+//	Name       string `json:"name"`
+//	StationIDs []int  `json:"station_ids"`
+//}
 
 type MapDescription struct {
 	name string
@@ -155,7 +199,7 @@ func main() {
 }
 
 // separateCloseNodes раздвигает узлы, чьи круги пересекаются или касаются
-func separateCloseNodes(mapData *MapData) {
+func separateCloseNodes(mapData *graph.MapData) {
 	// Радиус узла + обводка + небольшой запас
 	nodeRadius := 14.0
 	minDistance := nodeRadius*2 + 4 // 32px минимум между центрами
@@ -196,7 +240,7 @@ func separateCloseNodes(mapData *MapData) {
 	fmt.Printf("Node separation: %d iterations\n", iterations)
 }
 
-func convertToMapData(metro MetroAPI) MapData {
+func convertToMapData(metro MetroAPI) graph.MapData {
 	// Собираем все станции
 	type FlatStation struct {
 		Name   string
@@ -266,14 +310,14 @@ func convertToMapData(metro MetroAPI) MapData {
 
 	fmt.Printf("  Center: lat %.6f, lng %.6f\n", centerLat, centerLng)
 
-	mapData := MapData{
-		Nodes:      []NodeJSON{},
-		Edges:      []EdgeJSON{},
-		Hubs:       []HubJSON{},
+	mapData := graph.MapData{
+		Nodes:      []graph.NodeJSON{},
+		Edges:      []graph.EdgeJSON{},
+		Hubs:       []graph.HubJSON{},
 		LineColors: lineColors,
 	}
 
-	stationsByName := make(map[string][]NodeJSON)
+	stationsByName := make(map[string][]graph.NodeJSON)
 
 	nodeID := 1
 	for _, line := range metro.Lines {
@@ -289,7 +333,7 @@ func convertToMapData(metro MetroAPI) MapData {
 			x := offsetX + (station.Lng-centerLng)*scale
 			y := offsetY + (centerLat-station.Lat)*scale // Инвертируем Y!
 
-			node := NodeJSON{
+			node := graph.NodeJSON{
 				ID:     nodeID,
 				Name:   station.Name,
 				X:      math.Round(x*10) / 10,
@@ -303,7 +347,7 @@ func convertToMapData(metro MetroAPI) MapData {
 			stationsByName[station.Name] = append(stationsByName[station.Name], node)
 
 			if prevNodeID != -1 {
-				edge := EdgeJSON{
+				edge := graph.EdgeJSON{
 					ID:     len(mapData.Edges) + 1,
 					From:   prevNodeID,
 					To:     nodeID,
@@ -331,7 +375,7 @@ func convertToMapData(metro MetroAPI) MapData {
 					nodeIDs[i] = n.ID
 				}
 
-				hub := HubJSON{
+				hub := graph.HubJSON{
 					ID:         hubID,
 					Name:       name,
 					StationIDs: nodeIDs,
@@ -340,7 +384,7 @@ func convertToMapData(metro MetroAPI) MapData {
 
 				for i := 0; i < len(nodeIDs); i++ {
 					for j := i + 1; j < len(nodeIDs); j++ {
-						edge := EdgeJSON{
+						edge := graph.EdgeJSON{
 							ID:     len(mapData.Edges) + 1,
 							From:   nodeIDs[i],
 							To:     nodeIDs[j],

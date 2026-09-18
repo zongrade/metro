@@ -3,7 +3,7 @@ package graph
 import (
 	"embed"
 	"encoding/json"
-	"metro-wars/data"
+	"metro/data"
 	"os"
 )
 
@@ -11,7 +11,7 @@ type MapData struct {
 	Nodes      []NodeJSON        `json:"nodes"`
 	Edges      []EdgeJSON        `json:"edges"`
 	Hubs       []HubJSON         `json:"hubs"`
-	LineColors map[string]string `json:"line_colors"` // <-- Добавили
+	LineColors map[string]string `json:"line_colors"`
 }
 
 type NodeJSON struct {
@@ -36,6 +36,7 @@ type EdgeJSON struct {
 	To     int    `json:"to"`
 	Length int    `json:"length"`
 	Type   string `json:"type"`
+	Time   int    `json:"time,omitempty"`
 }
 
 type HubJSON struct {
@@ -97,6 +98,7 @@ func ParseMap(jsonBytes []byte) (*Graph, error) {
 			edgeJSON.From,
 			edgeJSON.To,
 			edgeJSON.Length,
+			edgeJSON.Time,
 			edgeJSON.Type,
 		)
 		g.AddEdge(edge)
