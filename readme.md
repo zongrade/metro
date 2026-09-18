@@ -28,18 +28,10 @@
 1. Клонируйте репозиторий:
 
     ```bash
-    git clone https://github.com/yourname/metro-map-generator.git
-    cd metro-map-generator
+    git clone https://github.com/zongrade/metro.git
+    cd metro
     ```
-
-2. Инициализируйте модуль (если ещё не сделан):
-
-    ```bash
-    go mod init metro-generator
-    go mod tidy
-    ```
-
-3. Поместите файлы `data.json` и `l10n.json` в папку `cmd/mapgen/data/<city_name>/`:
+2. Поместите файлы `data.json` и `l10n.json` в папку `cmd/mapgen/data/<city_name>/`:
 
     ```text
     cmd/mapgen/data/
@@ -51,7 +43,7 @@
         └── l10n.json
     ```
 
-4. Запустите генератор:
+3. Запустите генератор:
     ```bash
     go run cmd/mapgen/main.go
     ```
